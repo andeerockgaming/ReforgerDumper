@@ -103,7 +103,7 @@ class ReforgerDumperPluginSettings: ResourceManagerPlugin
 		array<string> extensions = {};
 		GetEnabledFileExtensions(extensions);
 
-		Workbench.SearchResources(SearchResourcesCallback, extensions);
+		ResourceDatabase.SearchResources(SearchResourcesCallback, extensions);
 		Print("Reforger Dumper has finished! Please move the files out of the profile directory for the sake of Workbench performance and then restart it");
 	}
 	
@@ -158,7 +158,7 @@ class ReforgerDumperPluginSettings: ResourceManagerPlugin
 		for (int i = 0; i < foldersCount; i++)
 		{
 			currentFolderPath += folders[i];
-			if (!FileIO.FileExist(currentFolderPath))
+			if (!FileIO.FileExists(currentFolderPath))
 			{
 				FileIO.MakeDirectory(currentFolderPath);
 			}
@@ -179,7 +179,7 @@ class ReforgerDumperPluginSettings: ResourceManagerPlugin
 		string inputPath = resName.GetPath();
 		
 		FileHandle inputFile = FileIO.OpenFile(inputPath, FileMode.READ);
-		if (inputFile == 0)
+		if (!inputFile)
 		{
 			Print("The file at the path could not be read: " + inputPath);
 			return;
@@ -187,22 +187,22 @@ class ReforgerDumperPluginSettings: ResourceManagerPlugin
 
 		// Our output path will start with $profile:Dump/
 		FileHandle outputFile = FileIO.OpenFile(outputPath, FileMode.WRITE);		
-		if (outputFile == 0)
+		if (!outputFile)
 		{
 			Print("The file at the path could not be created: " + outputPath);
-			inputFile.CloseFile();
+			inputFile.Close();
 			return;
 		}
 		
 		string line;
 		// If this was > 0 it would exit the loop on an empty line even if the file wasn't done
-		while (inputFile.FGets(line) >= 0)
+		while (inputFile.ReadLine(line) >= 0)
 		{
-			outputFile.FPrintln(line);
+			outputFile.WriteLine(line);
 		}
 
-		inputFile.CloseFile();
-		outputFile.CloseFile();
+		inputFile.Close();
+		outputFile.Close();
 	}
 	
 	// Ugly way to insert the enabled extensions into the array
