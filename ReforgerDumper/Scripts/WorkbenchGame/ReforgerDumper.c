@@ -96,113 +96,156 @@ class ReforgerDumperPluginSettings: ResourceManagerPlugin
 	[Attribute("1", UIWidgets.CheckBox, "Ignore files in the Workbench Game directory", category: "Settings")]
 	bool m_IgnoreWorkbenchGame;
 	
+	static ReforgerDumperPluginSettings s_Instance;
+	static ref array<string> s_FilesToDump;
+	static ref set<string> s_CreatedDirs;
+	static int s_QueueIndex;
 	
 	[ButtonAttribute("Dump")]
 	void DumpFiles()	
 	{
-		array<string> extensions = {};
-		GetEnabledFileExtensions(extensions);
+		s_Instance = this;
+		s_FilesToDump = new array<string>();
+		s_CreatedDirs = new set<string>();
+		s_QueueIndex = 0;
+		
+		SearchResourcesFilter filter = new SearchResourcesFilter();
+		filter.fileExtensions = {};
+		GetEnabledFileExtensions(filter.fileExtensions);
 
-		ResourceDatabase.SearchResources(SearchResourcesCallback, extensions);
-		Print("Reforger Dumper has finished! Please move the files out of the profile directory for the sake of Workbench performance and then restart it");
+		Print("Reforger Dumper: Scanning for resources... (UI may freeze briefly)");
+		ResourceDatabase.SearchResources(filter, SearchResourcesCallback);
+		
+		int total = s_FilesToDump.Count();
+		Print("Reforger Dumper: Should dump " + total + " files.");
+		
+		if (total > 0)
+		{
+			if (GetGame() && GetGame().GetCallqueue())
+			{
+				Print("Reforger Dumper: Starting async dump (Check logs for progress)...");
+				GetGame().GetCallqueue().CallLater(ProcessQueue, 0, true);
+			}
+			else
+			{
+				Print("Reforger Dumper: WARNING - Game CallQueue unavailable. Running synchronously (App will freeze!)");
+				ProcessQueueSync();
+			}
+		}
 	}
 	
-	// Callback run when a resource is found
-	void SearchResourcesCallback(ResourceName resName, string filePath = "")
+	// Callback run when a resource is found - now just collects paths
+	static void SearchResourcesCallback(ResourceName resName, string filePath = "")
 	{
 		if (filePath == string.Empty)
 		{
-			Print("Empty filepath for " + resName);
-			return;
+			// Try to fallback
+			if (resName) 
+				filePath = resName.GetPath();
+				
+			if (filePath == string.Empty) return;
 		}
 
+		// Quick filter check
+		if (s_Instance && s_Instance.m_IgnoreWorkbenchGame && filePath.Contains("WorkbenchGame"))
+		{
+			return;
+		}
+		
+		s_FilesToDump.Insert(filePath);
+	}
+	
+	static void ProcessQueue()
+	{
+		// Process X files per frame
+		int batchSize = 50; 
+		int total = s_FilesToDump.Count();
+		
+		for (int i = 0; i < batchSize; i++)
+		{
+			if (s_QueueIndex >= total)
+			{
+				GetGame().GetCallqueue().Remove(ProcessQueue);
+				Print("Reforger Dumper: Dump Finished! " + total + " files processed.");
+				Print("Please move the files out of the profile directory for the sake of Workbench performance and then restart it.");
+				return;
+			}
+			
+			string file = s_FilesToDump[s_QueueIndex];
+			ProcessFile(file);
+			s_QueueIndex++;
+		}
+		
+		if (s_QueueIndex % 1000 < batchSize)
+		{
+			Print("Reforger Dumper: Progress " + s_QueueIndex + " / " + total);
+		}
+	}
+	
+	static void ProcessQueueSync()
+	{
+		int total = s_FilesToDump.Count();
+		for (int i = 0; i < total; i++)
+		{
+			ProcessFile(s_FilesToDump[i]);
+			if (i % 1000 == 0) Print("Reforger Dumper: Progress " + i + " / " + total);
+		}
+		Print("Reforger Dumper: Dump Finished!");
+	}
+	
+	static void ProcessFile(string filePath)
+	{
 		int colonIndex = filePath.IndexOf(":");
-		if (colonIndex == -1)
-		{
-			Print("colonIndex was -1 for " + filePath);
-			return;
-		}
+		if (colonIndex == -1) return;
 		
-		if (m_IgnoreWorkbenchGame && filePath.Contains("WorkbenchGame"))
-		{
-			return;
-		}
-
-		// Example: `$core:system/materials/PBRDiffuseProbe.ema`
-		// Changing this string to be the path `core/system/materials/PBRDiffuseProbe.ema`
 		string rootDir = filePath.Substring(1, colonIndex - 1);
-		// This would lead to duplicate data if this was run again. Hedging my bets on only the
-		// first letter being capitalized if it isn't the default of "profile"
-		if (rootDir.Contains("profile") || rootDir.Contains("Profile"))
-		{
-			return;
-		}
+		if (rootDir.Contains("profile") || rootDir.Contains("Profile")) return;
 		
-		// Example: `$core:system/materials/PBRDiffuseProbe.ema` would get saved to
-		// `Dump/core/system/materials/PBRDiffuseProbe.ema`
 		string localPath = "Dump/" + rootDir + "/" + filePath.Substring(colonIndex + 1, filePath.Length() - colonIndex - 1);
 		
-		
-		/* From what I can tell if you want to create a directory but the parent directories don't
-		 * exist you have to create the whole tree above it. We can do this by splitting the path
-		 * on the / and then iterate over it seeing if we need to make the directory
-		 */
-		array<string> folders = new array<string>();
-		localPath.Split("/", folders, true);
-
-		// The last "folder" is really the name of the file
-		int foldersCount = folders.Count() - 1;
-		// We can only create files in $profile or $saves
-		string currentFolderPath = "$profile:";
-
-		for (int i = 0; i < foldersCount; i++)
+		// Directory creation with caching
+		// Get directory path from localPath
+		int lastSlash = localPath.LastIndexOf("/");
+		if (lastSlash != -1)
 		{
-			currentFolderPath += folders[i];
-			if (!FileIO.FileExists(currentFolderPath))
+			string dirPath = "$profile:" + localPath.Substring(0, lastSlash);
+			if (!s_CreatedDirs.Contains(dirPath))
 			{
-				FileIO.MakeDirectory(currentFolderPath);
-			}
-			if (!currentFolderPath.EndsWith("/"))
-			{
-				currentFolderPath += "/";
+				// We still need to ensure parent structure exists, but Enfusion FileIO MakeDirectory might not be recursive?
+				// Original code did recursive split.
+				// Let's do a simplified recursive check but cache results.
+				
+				// Re-implementing simplified recursive create with cache
+				array<string> tempFolders = new array<string>();
+				localPath.Split("/", tempFolders, true);
+				int count = tempFolders.Count() - 1; // last is filename
+				string currentFolderPath = "$profile:";
+				
+				for (int i = 0; i < count; i++)
+				{
+					currentFolderPath += tempFolders[i];
+					if (!s_CreatedDirs.Contains(currentFolderPath))
+					{
+						if (!FileIO.FileExists(currentFolderPath))
+						{
+							FileIO.MakeDirectory(currentFolderPath);
+						}
+						s_CreatedDirs.Insert(currentFolderPath);
+					}
+					currentFolderPath += "/";
+				}
 			}
 		}
-		
 
-		WriteFile(resName, localPath);
+		WriteFile(filePath, "$profile:" + localPath);
 	}
 	
 	// Reads from the ResourceName and writes to the local file system
-	void WriteFile(ResourceName resName, string outputPath)
+	static void WriteFile(string inputPath, string outputPath)
 	{
-		// This path will be along the lines of $core:system/materials/PBRDiffuseProbe.ema
-		string inputPath = resName.GetPath();
-		
-		FileHandle inputFile = FileIO.OpenFile(inputPath, FileMode.READ);
-		if (!inputFile)
-		{
-			Print("The file at the path could not be read: " + inputPath);
-			return;
-		}
-
-		// Our output path will start with $profile:Dump/
-		FileHandle outputFile = FileIO.OpenFile(outputPath, FileMode.WRITE);		
-		if (!outputFile)
-		{
-			Print("The file at the path could not be created: " + outputPath);
-			inputFile.Close();
-			return;
-		}
-		
-		string line;
-		// If this was > 0 it would exit the loop on an empty line even if the file wasn't done
-		while (inputFile.ReadLine(line) >= 0)
-		{
-			outputFile.WriteLine(line);
-		}
-
-		inputFile.Close();
-		outputFile.Close();
+		// Use optimized CopyFile instead of manual read/write loop to support binary files and speed up processing
+		// Logic handles prefixes
+		FileIO.CopyFile(inputPath, outputPath); 
 	}
 	
 	// Ugly way to insert the enabled extensions into the array
